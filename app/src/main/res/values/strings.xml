@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Recall</string>
+    <string name="notification_channel_name">Recall Processing</string>
+    <string name="notification_channel_desc">Notifications for audio transcription and AI summarization</string>
+</resources>
