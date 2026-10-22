@@ -13,6 +13,23 @@ Runs completely in the background, requires zero user interaction after first la
 - **Microphone Audio Recording:** Captures the user's microphone during the call using native `MediaRecorder.AudioSource.MIC` in MPEG-4 / AAC format (44.1 kHz, 64 kbps, Mono).
 - **Anti-Popup & Silent:** Uses a silent, minimal-importance notification channel (`IMPORTANCE_MIN`). Never launches activities or toasts during calls.
 - **Survives Reboots:** Restarts automatically on `BOOT_COMPLETED`.
+- **Optional On-Device AI Engine:** Disabled by default. Can be toggled on to download an open-source Whisper model (~75 MB) with a real-time byte counter, automatically transcribe recordings, and generate daily structured summaries per phone number with extracted decisions and action items.
+
+---
+
+## 🤖 Optional On-Device AI Transcription & Daily Summaries
+
+The app includes an optional, fully local AI pipeline for transcribing call recordings and generating daily executive summaries grouped by phone number:
+
+1. **Disabled by Default:** Zero CPU/memory overhead until explicitly enabled in settings.
+2. **On-Demand Model Download:** Toggling "On-Device AI Engine" in the UI starts a background download of the open-source Whisper tiny model (`ggml-tiny.bin`, ~75 MB) displaying a real-time progress counter (`X.X MB / 75.0 MB (Y%)`).
+3. **Daily Aggregation per Contact:**
+   - Multiple calls with the same contact on the same date are automatically grouped together.
+   - Saves structured summary JSON and human-readable text under `/sdcard/Android/data/com.recall.app/files/Summaries/`.
+   - Filename format: `<phoneNumber>_<YYYY-MM-DD>_summary.json` and `.txt`.
+4. **Action Item & Decision Extraction:**
+   - Detects agreements, decisions, and action items (supporting English, Hindi, and Hinglish keywords like *"pakka"*, *"theek hai"*, *"bhej dunga"*, *"agreed"*, *"finalized"*).
+   - Tap any entry under "Daily Call Summaries by Number" in the app to view the complete daily brief.
 
 ---
 
