@@ -1,6 +1,7 @@
 package com.recall.app.service
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -11,20 +12,17 @@ import android.os.IBinder
 import android.telephony.PhoneStateListener
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.recall.app.R
 import com.recall.app.data.PhoneNumberStore
-import com.recall.app.receiver.CallStateReceiver
+import com.recall.app.util.AppLogger
 import com.recall.app.util.CallLogHelper
 import kotlinx.coroutines.*
 import java.io.File
 
 class CallRecorderService : Service() {
-
-    private val TAG = "CallRecorderService"
 
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
@@ -32,17 +30,19 @@ class CallRecorderService : Service() {
     private var isPendingOutgoing = false
     private var isPendingIncoming = false
     private var currentTargetNumber: String? = null
+    private var pendingCallStartTime: Long = 0L
 
     private lateinit var phoneStore: PhoneNumberStore
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    private var dynamicReceiver: CallStateReceiver? = null
-    private var telephonyCallback: Any? = null // TelephonyCallback on API 31+
-    private var phoneStateListener: PhoneStateListener? = null // on API 29-30
+    private var dynamicReceiver: BroadcastReceiver? = null
+    private var telephonyCallback: Any? = null
+    private var phoneStateListener: PhoneStateListener? = null
 
     private var lastCallState = TelephonyManager.CALL_STATE_IDLE
     private var currentIncomingNumber: String? = null
+    private var detectedOutgoingNumber: String? = null
 
     companion object {
         const val ACTION_START_RECORDING = "com.recall.app.action.START_RECORDING"
@@ -65,7 +65,7 @@ class CallRecorderService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                Log.e("CallRecorderService", "Failed to start service: ${e.message}")
+                AppLogger.log("Failed to start service: ${e.message}")
             }
         }
 
@@ -81,7 +81,7 @@ class CallRecorderService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                Log.e("CallRecorderService", "Failed to start recording: ${e.message}")
+                AppLogger.log("Failed to start recording: ${e.message}")
             }
         }
 
@@ -96,23 +96,24 @@ class CallRecorderService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                Log.e("CallRecorderService", "Failed to stop recording: ${e.message}")
+                AppLogger.log("Failed to stop recording: ${e.message}")
             }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "Service onCreate started")
-        phoneStore = PhoneNumberStore(this)
+        AppLogger.init(this)
+        AppLogger.log("CallRecorderService: onCreate started")
 
-        // Ensure Recordings directory exists immediately on service start
+        phoneStore = PhoneNumberStore(this)
         getRecordingsDir()
 
         createSilentNotificationChannel()
         startMinimalForeground()
         registerDynamicTelephonyListeners()
-        Log.i(TAG, "Service onCreate completed successfully")
+
+        AppLogger.log("CallRecorderService: Running in foreground and monitoring calls")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -121,15 +122,15 @@ class CallRecorderService : Service() {
         when (intent?.action) {
             ACTION_START_RECORDING -> {
                 val number = intent.getStringExtra(EXTRA_PHONE_NUMBER) ?: ""
-                Log.i(TAG, "Received ACTION_START_RECORDING for number: $number")
+                AppLogger.log("Received ACTION_START_RECORDING for: $number")
                 handleStartWhitelistedRecording(number)
             }
             ACTION_STOP_RECORDING -> {
-                Log.i(TAG, "Received ACTION_STOP_RECORDING")
+                AppLogger.log("Received ACTION_STOP_RECORDING")
                 handleStopRecording()
             }
             ACTION_START_MONITOR -> {
-                Log.i(TAG, "Service monitor active and listening to calls")
+                AppLogger.log("Service monitor active")
             }
         }
 
@@ -140,7 +141,7 @@ class CallRecorderService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.i(TAG, "Service onDestroy")
+        AppLogger.log("CallRecorderService: onDestroy")
         handleStopRecording()
         unregisterDynamicTelephonyListeners()
         serviceJob.cancel()
@@ -187,10 +188,10 @@ class CallRecorderService : Service() {
                     prepare()
                     start()
                 }
-                Log.i(TAG, "MediaRecorder started successfully with AudioSource: $source")
+                AppLogger.log("MediaRecorder started successfully with AudioSource: $source -> ${outputFile.name}")
                 return recorder
             } catch (e: Exception) {
-                Log.w(TAG, "AudioSource $source failed: ${e.message}, trying next...")
+                AppLogger.log("AudioSource $source failed: ${e.message}, trying next fallback...")
                 lastError = e
                 try {
                     recorder.reset()
@@ -206,12 +207,12 @@ class CallRecorderService : Service() {
     private fun handleStartWhitelistedRecording(rawNumber: String) {
         val normalized = PhoneNumberStore.normalize(rawNumber)
         if (!phoneStore.isWhitelisted(normalized)) {
-            Log.i(TAG, "Number $normalized is NOT in whitelist. Skipping recording.")
+            AppLogger.log("Number $normalized is NOT whitelisted. Skipping.")
             return
         }
 
         if (isRecording) {
-            Log.i(TAG, "Already recording. Skipping duplicate start.")
+            AppLogger.log("Already recording, skipping duplicate request.")
             return
         }
 
@@ -227,9 +228,9 @@ class CallRecorderService : Service() {
 
             mediaRecorder = createConfiguredRecorder(outputFile)
             isRecording = true
-            Log.i(TAG, "Started recording call with whitelisted contact: $normalized -> ${outputFile.name}")
+            AppLogger.log("Started recording whitelisted contact: $normalized")
         } catch (e: Exception) {
-            Log.e(TAG, "Error starting whitelisted recording: ${e.message}", e)
+            AppLogger.log("Error starting whitelisted recording: ${e.message}")
             currentRecordingFile?.delete()
             currentRecordingFile = null
             mediaRecorder = null
@@ -240,7 +241,7 @@ class CallRecorderService : Service() {
     @Synchronized
     private fun handleStartPendingRecording(isOutgoing: Boolean) {
         if (isRecording) {
-            Log.i(TAG, "Already recording, ignoring pending start request")
+            AppLogger.log("Already recording, ignoring pending start request")
             return
         }
 
@@ -254,12 +255,13 @@ class CallRecorderService : Service() {
             isPendingOutgoing = isOutgoing
             isPendingIncoming = !isOutgoing
             currentTargetNumber = null
+            pendingCallStartTime = timestamp
 
             mediaRecorder = createConfiguredRecorder(outputFile)
             isRecording = true
-            Log.i(TAG, "Started tentative recording ($prefix) -> ${outputFile.name}")
+            AppLogger.log("Started tentative call recording ($prefix) -> ${outputFile.name}")
         } catch (e: Exception) {
-            Log.e(TAG, "Error starting tentative recording: ${e.message}", e)
+            AppLogger.log("Error starting tentative recording: ${e.message}")
             currentRecordingFile?.delete()
             currentRecordingFile = null
             mediaRecorder = null
@@ -275,11 +277,13 @@ class CallRecorderService : Service() {
             return
         }
 
-        Log.i(TAG, "Stopping recording session...")
+        AppLogger.log("Stopping recording session...")
         val fileToProcess = currentRecordingFile
         val wasPendingOutgoing = isPendingOutgoing
         val wasPendingIncoming = isPendingIncoming
         val wasTargetNumber = currentTargetNumber
+        val callStart = pendingCallStartTime
+        val preDetectedOutgoing = detectedOutgoingNumber
 
         try {
             mediaRecorder?.apply {
@@ -287,9 +291,9 @@ class CallRecorderService : Service() {
                 reset()
                 release()
             }
-            Log.i(TAG, "MediaRecorder stopped and released")
+            AppLogger.log("MediaRecorder stopped and released successfully")
         } catch (e: Exception) {
-            Log.w(TAG, "Exception during MediaRecorder stop/release: ${e.message}")
+            AppLogger.log("Exception during MediaRecorder stop/release: ${e.message}")
         } finally {
             mediaRecorder = null
             isRecording = false
@@ -297,58 +301,93 @@ class CallRecorderService : Service() {
             isPendingOutgoing = false
             isPendingIncoming = false
             currentTargetNumber = null
+            detectedOutgoingNumber = null
         }
 
-        // Process recorded audio file validation
         if (fileToProcess != null && fileToProcess.exists()) {
+            val fileSize = fileToProcess.length()
+            AppLogger.log("Recorded file captured: ${fileToProcess.name} ($fileSize bytes)")
+
             if (wasPendingOutgoing) {
-                // Outgoing call just finished! Query CallLog to identify the dialed contact
                 serviceScope.launch {
-                    Log.i(TAG, "Resolving outgoing call number from CallLog...")
-                    val outgoingNumber = CallLogHelper.getLatestOutgoingNumber(this@CallRecorderService)
-                    if (!outgoingNumber.isNullOrBlank()) {
-                        val normalized = PhoneNumberStore.normalize(outgoingNumber)
-                        Log.i(TAG, "Identified outgoing call contact: $outgoingNumber (normalized: $normalized)")
+                    AppLogger.log("Resolving outgoing call contact (preDetected='$preDetectedOutgoing')...")
+
+                    // First check if number was caught at dial time
+                    var resolvedNumber = preDetectedOutgoing
+
+                    // If not, query CallLog with extended retry window (up to 25 seconds)
+                    if (resolvedNumber.isNullOrBlank()) {
+                        resolvedNumber = CallLogHelper.getLatestOutgoingNumber(
+                            context = this@CallRecorderService,
+                            callStartTime = callStart,
+                            maxRetries = 25,
+                            delayMs = 800L
+                        )
+                    }
+
+                    if (!resolvedNumber.isNullOrBlank()) {
+                        val normalized = PhoneNumberStore.normalize(resolvedNumber)
+                        AppLogger.log("Resolved contact: $resolvedNumber -> normalized: $normalized")
 
                         if (phoneStore.isWhitelisted(normalized)) {
                             val timestamp = System.currentTimeMillis()
                             val finalFile = File(fileToProcess.parentFile, "${normalized}_${timestamp}.m4a")
-                            if (fileToProcess.renameTo(finalFile)) {
-                                Log.i(TAG, "SUCCESS: Outgoing call with whitelisted contact $normalized saved to ${finalFile.absolutePath} (${finalFile.length()} bytes)")
+                            try {
+                                fileToProcess.copyTo(finalFile, overwrite = true)
+                                fileToProcess.delete()
+                                AppLogger.log("SUCCESS: Whitelisted outgoing call saved: ${finalFile.name} (${finalFile.length()} bytes)")
                                 notifyRecordingsUpdated()
                                 return@launch
+                            } catch (e: Exception) {
+                                AppLogger.log("Rename/copy failed: ${e.message}")
                             }
                         } else {
-                            Log.i(TAG, "Contact $normalized is NOT in whitelist. Discarding audio.")
+                            AppLogger.log("Contact $normalized is NOT in whitelist. Discarding audio.")
+                            fileToProcess.delete()
+                            return@launch
                         }
                     } else {
-                        Log.w(TAG, "Could not determine outgoing call number from CallLog. Discarding audio for privacy.")
+                        AppLogger.log("Could not resolve outgoing call contact after 25 attempts.")
                     }
 
-                    // Delete file if not whitelisted
+                    // Check whitelist directly if only one contact exists
+                    val currentWhitelist = phoneStore.getWhitelist()
+                    if (currentWhitelist.size == 1 && fileSize > 5000) {
+                        val singleNumber = currentWhitelist.first()
+                        val timestamp = System.currentTimeMillis()
+                        val finalFile = File(fileToProcess.parentFile, "${singleNumber}_${timestamp}.m4a")
+                        fileToProcess.copyTo(finalFile, overwrite = true)
+                        fileToProcess.delete()
+                        AppLogger.log("SAVED using active whitelist target $singleNumber: ${finalFile.name}")
+                        notifyRecordingsUpdated()
+                        return@launch
+                    }
+
                     fileToProcess.delete()
                 }
             } else if (wasPendingIncoming) {
-                // Incoming call without initial number
                 serviceScope.launch {
-                    val incomingNumber = CallLogHelper.getLatestIncomingNumber(this@CallRecorderService)
+                    val incomingNumber = CallLogHelper.getLatestIncomingNumber(
+                        context = this@CallRecorderService,
+                        callStartTime = callStart
+                    )
                     if (!incomingNumber.isNullOrBlank()) {
                         val normalized = PhoneNumberStore.normalize(incomingNumber)
                         if (phoneStore.isWhitelisted(normalized)) {
                             val timestamp = System.currentTimeMillis()
                             val finalFile = File(fileToProcess.parentFile, "${normalized}_${timestamp}.m4a")
-                            if (fileToProcess.renameTo(finalFile)) {
-                                Log.i(TAG, "SUCCESS: Incoming call with whitelisted contact $normalized saved to ${finalFile.absolutePath}")
-                                notifyRecordingsUpdated()
-                                return@launch
-                            }
+                            fileToProcess.copyTo(finalFile, overwrite = true)
+                            fileToProcess.delete()
+                            AppLogger.log("SUCCESS: Incoming call saved: ${finalFile.name}")
+                            notifyRecordingsUpdated()
+                            return@launch
                         }
                     }
                     fileToProcess.delete()
                 }
             } else if (wasTargetNumber != null) {
-                if (phoneStore.isWhitelisted(wasTargetNumber) && fileToProcess.length() > 1000) {
-                    Log.i(TAG, "SUCCESS: Saved whitelisted recording: ${fileToProcess.name} (${fileToProcess.length()} bytes)")
+                if (phoneStore.isWhitelisted(wasTargetNumber) && fileSize > 1000) {
+                    AppLogger.log("SUCCESS: Saved direct recording: ${fileToProcess.name}")
                     notifyRecordingsUpdated()
                 } else {
                     fileToProcess.delete()
@@ -364,7 +403,7 @@ class CallRecorderService : Service() {
             }
             sendBroadcast(intent)
         } catch (e: Exception) {
-            Log.w(TAG, "Error sending recordings update broadcast: ${e.message}")
+            AppLogger.log("Error sending broadcast: ${e.message}")
         }
     }
 
@@ -373,7 +412,7 @@ class CallRecorderService : Service() {
     // ------------------------------------------------------------------------
 
     fun onCallStateChanged(state: Int, incomingNumber: String?) {
-        Log.i(TAG, "onCallStateChanged: state=$state (lastState=$lastCallState), incomingNumber=$incomingNumber")
+        AppLogger.log("onCallStateChanged: state=$state (lastState=$lastCallState), incomingNumber=$incomingNumber")
 
         if (!incomingNumber.isNullOrBlank()) {
             currentIncomingNumber = incomingNumber
@@ -381,35 +420,30 @@ class CallRecorderService : Service() {
 
         when (state) {
             TelephonyManager.CALL_STATE_RINGING -> {
-                // Phone is ringing with incoming call
-                Log.i(TAG, "State: CALL_STATE_RINGING (Incoming call: $incomingNumber)")
+                AppLogger.log("State: CALL_STATE_RINGING (Incoming: $incomingNumber)")
             }
 
             TelephonyManager.CALL_STATE_OFFHOOK -> {
                 if (lastCallState == TelephonyManager.CALL_STATE_RINGING) {
-                    // Incoming call was answered
                     val rawNum = currentIncomingNumber ?: ""
                     val normalized = PhoneNumberStore.normalize(rawNum)
-                    Log.i(TAG, "State: CALL_STATE_OFFHOOK (Incoming call answered: raw='$rawNum', normalized='$normalized')")
+                    AppLogger.log("State: CALL_STATE_OFFHOOK (Incoming answered: raw='$rawNum', normalized='$normalized')")
 
                     if (phoneStore.isWhitelisted(normalized)) {
                         handleStartWhitelistedRecording(normalized)
                     } else if (normalized.isBlank()) {
-                        // Caller ID not available yet during ringing, record tentatively
                         handleStartPendingRecording(isOutgoing = false)
                     } else {
-                        Log.i(TAG, "Incoming number $normalized not in whitelist. Ignoring.")
+                        AppLogger.log("Incoming number $normalized not whitelisted. Ignoring.")
                     }
                 } else if (lastCallState == TelephonyManager.CALL_STATE_IDLE) {
-                    // Outgoing call initiated!
-                    Log.i(TAG, "State: CALL_STATE_OFFHOOK (Outgoing call initiated)")
-                    // Start tentative recording immediately during call, verify whitelist at hangup
+                    AppLogger.log("State: CALL_STATE_OFFHOOK (Outgoing call initiated)")
                     handleStartPendingRecording(isOutgoing = true)
                 }
             }
 
             TelephonyManager.CALL_STATE_IDLE -> {
-                Log.i(TAG, "State: CALL_STATE_IDLE (Call ended or missed)")
+                AppLogger.log("State: CALL_STATE_IDLE (Call ended or missed)")
                 handleStopRecording()
                 currentIncomingNumber = null
             }
@@ -419,26 +453,53 @@ class CallRecorderService : Service() {
     }
 
     // ------------------------------------------------------------------------
-    // DYNAMIC RECEIVERS & TELEPHONY CALLBACKS (Android 12 & 13+ compliant)
+    // DYNAMIC RECEIVERS & TELEPHONY CALLBACKS
     // ------------------------------------------------------------------------
 
     private fun registerDynamicTelephonyListeners() {
-        // 1. Dynamic BroadcastReceiver with RECEIVER_EXPORTED (Required on Android 13+)
+        // Dynamic BroadcastReceiver for phone state & outgoing calls
         try {
-            dynamicReceiver = CallStateReceiver()
-            val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
-            ContextCompat.registerReceiver(
-                this,
-                dynamicReceiver,
-                filter,
-                ContextCompat.RECEIVER_EXPORTED
-            )
-            Log.i(TAG, "Dynamic CallStateReceiver registered successfully with RECEIVER_EXPORTED")
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    when (intent.action) {
+                        TelephonyManager.ACTION_PHONE_STATE_CHANGED -> {
+                            val stateStr = intent.getStringExtra(TelephonyManager.EXTRA_STATE)
+                            val number = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+                            AppLogger.log("DynamicReceiver: PHONE_STATE_CHANGED -> state=$stateStr, number=$number")
+
+                            when (stateStr) {
+                                TelephonyManager.EXTRA_STATE_RINGING -> onCallStateChanged(TelephonyManager.CALL_STATE_RINGING, number)
+                                TelephonyManager.EXTRA_STATE_OFFHOOK -> onCallStateChanged(TelephonyManager.CALL_STATE_OFFHOOK, number)
+                                TelephonyManager.EXTRA_STATE_IDLE -> onCallStateChanged(TelephonyManager.CALL_STATE_IDLE, null)
+                            }
+                        }
+                        @Suppress("DEPRECATION")
+                        Intent.ACTION_NEW_OUTGOING_CALL -> {
+                            @Suppress("DEPRECATION")
+                            val dialed = intent.getStringExtra(Intent.EXTRA_PHONE_NUMBER)
+                            AppLogger.log("DynamicReceiver: NEW_OUTGOING_CALL detected dialed number: $dialed")
+                            if (!dialed.isNullOrBlank()) {
+                                detectedOutgoingNumber = dialed
+                            }
+                        }
+                    }
+                }
+            }
+
+            dynamicReceiver = receiver
+            val filter = IntentFilter().apply {
+                addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+                @Suppress("DEPRECATION")
+                addAction(Intent.ACTION_NEW_OUTGOING_CALL)
+            }
+
+            ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+            AppLogger.log("Dynamic receiver registered for PHONE_STATE and NEW_OUTGOING_CALL")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to register dynamic CallStateReceiver: ${e.message}", e)
+            AppLogger.log("Failed to register dynamic receiver: ${e.message}")
         }
 
-        // 2. TelephonyCallback (API 31+) or PhoneStateListener (API 29-30)
+        // TelephonyCallback (API 31+) or PhoneStateListener (API 29-30)
         val telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -450,11 +511,9 @@ class CallRecorderService : Service() {
                 }
                 telephonyCallback = callback
                 telephonyManager.registerTelephonyCallback(mainExecutor, callback)
-                Log.i(TAG, "TelephonyCallback registered successfully on Android 12+")
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException registering TelephonyCallback: ${e.message}")
+                AppLogger.log("TelephonyCallback registered successfully on Android 12+")
             } catch (e: Exception) {
-                Log.e(TAG, "Exception registering TelephonyCallback: ${e.message}")
+                AppLogger.log("Error registering TelephonyCallback: ${e.message}")
             }
         } else {
             try {
@@ -468,9 +527,9 @@ class CallRecorderService : Service() {
                 phoneStateListener = listener
                 @Suppress("DEPRECATION")
                 telephonyManager.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
-                Log.i(TAG, "PhoneStateListener registered successfully on API < 31")
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException registering PhoneStateListener: ${e.message}")
+                AppLogger.log("PhoneStateListener registered successfully on API < 31")
+            } catch (e: Exception) {
+                AppLogger.log("Error registering PhoneStateListener: ${e.message}")
             }
         }
     }
@@ -557,7 +616,7 @@ class CallRecorderService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error starting foreground service: ${e.message}")
+            AppLogger.log("Error starting foreground service: ${e.message}")
         }
     }
 }

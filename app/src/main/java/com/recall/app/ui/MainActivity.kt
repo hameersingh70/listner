@@ -28,6 +28,7 @@ import com.recall.app.ai.*
 import com.recall.app.data.AiSettingsStore
 import com.recall.app.data.PhoneNumberStore
 import com.recall.app.service.CallRecorderService
+import com.recall.app.util.AppLogger
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.File
@@ -95,6 +96,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        AppLogger.init(this)
+        AppLogger.log("MainActivity onCreate")
 
         // Ensure storage directories exist immediately
         getExternalFilesDir("Recordings")?.mkdirs()
