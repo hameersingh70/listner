@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_name">Recall Chat Memory</string>
+    <string name="accessibility_service_description">Captures and organizes conversation snapshots and commitments from designated messaging applications (WhatsApp, Telegram, Signal, Messages) into your local private journal. Operates strictly locally with zero external transmission.</string>
+    <string name="chat_accessibility_section_title">Chat Capture (Accessibility)</string>
+    <string name="chat_accessibility_section_desc">Captures snapshots and metadata from monitored messaging apps.</string>
+</resources>

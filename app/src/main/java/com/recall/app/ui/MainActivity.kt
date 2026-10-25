@@ -25,12 +25,17 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.recall.app.R
 import com.recall.app.ai.*
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.view.accessibility.AccessibilityManager
+import com.recall.app.accessibility.ChatAccessibilityService
 import com.recall.app.data.AiSettingsStore
+import com.recall.app.data.ChatTargetStore
 import com.recall.app.data.PhoneNumberStore
 import com.recall.app.service.CallRecorderService
 import com.recall.app.util.AppLogger
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -41,6 +46,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var phoneStore: PhoneNumberStore
     private lateinit var aiSettings: AiSettingsStore
+    private lateinit var chatTargetStore: ChatTargetStore
     private lateinit var downloadManager: ModelDownloadManager
     private lateinit var transcriptionEngine: LocalTranscriptionEngine
 
@@ -54,6 +60,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var summaryAdapter: ArrayAdapter<String>
     private val summaryItems = mutableListOf<String>()
 
+    private lateinit var snapshotsAdapter: ArrayAdapter<String>
+    private val snapshotsItems = mutableListOf<String>()
+    private val snapshotMetadataFiles = mutableListOf<File>()
+
     private lateinit var tvStatus: TextView
     private lateinit var btnPermissions: Button
     private lateinit var btnBatteryOpt: Button
@@ -65,6 +75,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnRefreshRecordings: Button
     private lateinit var tvRecordingsPath: TextView
     private lateinit var lvDailySummaries: ListView
+
+    // Chat Accessibility UI
+    private lateinit var switchChatCapture: MaterialSwitch
+    private lateinit var tvAccessibilityStatus: TextView
+    private lateinit var btnOpenAccessibilitySettings: Button
+    private lateinit var tvSnapshotsPath: TextView
+    private lateinit var lvChatSnapshots: ListView
 
     // AI UI Components
     private lateinit var switchAiEnabled: MaterialSwitch
@@ -87,6 +104,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val snapshotsUpdateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            refreshSnapshotsUI()
+            updateAccessibilityUIState()
+        }
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
@@ -103,29 +127,38 @@ class MainActivity : AppCompatActivity() {
         // Ensure storage directories exist immediately
         getExternalFilesDir("Recordings")?.mkdirs()
         getExternalFilesDir("Summaries")?.mkdirs()
+        getExternalFilesDir("ChatSnapshots")?.mkdirs()
 
         phoneStore = PhoneNumberStore(this)
         aiSettings = AiSettingsStore(this)
+        chatTargetStore = ChatTargetStore(this)
         downloadManager = ModelDownloadManager(this)
         transcriptionEngine = LocalTranscriptionEngine(this)
 
         initViews()
         setupRecordingsSection()
         setupWhitelistSection()
+        setupAccessibilitySection()
         setupAiSection()
         setupSummarySection()
 
         checkPermissionsAndStartService()
 
-        // Register local update receiver
-        val filter = IntentFilter(CallRecorderService.ACTION_RECORDINGS_UPDATED)
-        ContextCompat.registerReceiver(this, recordingsUpdateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        // Register local update receivers
+        val filterRecordings = IntentFilter(CallRecorderService.ACTION_RECORDINGS_UPDATED)
+        ContextCompat.registerReceiver(this, recordingsUpdateReceiver, filterRecordings, ContextCompat.RECEIVER_NOT_EXPORTED)
+
+        val filterSnapshots = IntentFilter(ChatAccessibilityService.ACTION_SNAPSHOTS_UPDATED)
+        ContextCompat.registerReceiver(this, snapshotsUpdateReceiver, filterSnapshots, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
             unregisterReceiver(recordingsUpdateReceiver)
+        } catch (ignored: Exception) {}
+        try {
+            unregisterReceiver(snapshotsUpdateReceiver)
         } catch (ignored: Exception) {}
         activeMediaPlayer?.release()
         activeMediaPlayer = null
@@ -143,6 +176,13 @@ class MainActivity : AppCompatActivity() {
         btnRefreshRecordings = findViewById(R.id.btnRefreshRecordings)
         tvRecordingsPath = findViewById(R.id.tvRecordingsPath)
         lvDailySummaries = findViewById(R.id.lvDailySummaries)
+
+        // Chat Accessibility Views
+        switchChatCapture = findViewById(R.id.switchChatCaptureEnabled)
+        tvAccessibilityStatus = findViewById(R.id.tvAccessibilityStatus)
+        btnOpenAccessibilitySettings = findViewById(R.id.btnOpenAccessibilitySettings)
+        tvSnapshotsPath = findViewById(R.id.tvSnapshotsPath)
+        lvChatSnapshots = findViewById(R.id.lvChatSnapshots)
 
         switchAiEnabled = findViewById(R.id.switchAiEnabled)
         layoutDownloadProgress = findViewById(R.id.layoutDownloadProgress)
@@ -292,6 +332,153 @@ class MainActivity : AppCompatActivity() {
             phoneStore.removeNumber(number)
             refreshWhitelistUI()
             true
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // CHAT ACCESSIBILITY CAPTURE SECTION
+    // ------------------------------------------------------------------------
+
+    private fun setupAccessibilitySection() {
+        switchChatCapture.isChecked = chatTargetStore.isChatCaptureEnabled
+        updateAccessibilityUIState()
+
+        switchChatCapture.setOnCheckedChangeListener { _, isChecked ->
+            chatTargetStore.isChatCaptureEnabled = isChecked
+            updateAccessibilityUIState()
+        }
+
+        btnOpenAccessibilitySettings.setOnClickListener {
+            try {
+                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                startActivity(intent)
+            } catch (e: Exception) {
+                Toast.makeText(this, "Could not open accessibility settings: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        snapshotsAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, snapshotsItems)
+        lvChatSnapshots.adapter = snapshotsAdapter
+        refreshSnapshotsUI()
+
+        lvChatSnapshots.setOnItemClickListener { _, _, position, _ ->
+            if (position in snapshotMetadataFiles.indices) {
+                val file = snapshotMetadataFiles[position]
+                showSnapshotDetailsDialog(file)
+            }
+        }
+    }
+
+    private fun updateAccessibilityUIState() {
+        val isServiceRunning = isAccessibilityServiceEnabled(this, ChatAccessibilityService::class.java)
+
+        if (!chatTargetStore.isChatCaptureEnabled) {
+            tvAccessibilityStatus.text = "Status: Disabled (Toggle switch to enable)"
+            tvAccessibilityStatus.setTextColor(ContextCompat.getColor(this, android.R.color.darker_gray))
+            btnOpenAccessibilitySettings.visibility = View.GONE
+        } else if (isServiceRunning) {
+            tvAccessibilityStatus.text = "Status: ACTIVE (Monitoring Target Chats)"
+            tvAccessibilityStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_green_dark))
+            btnOpenAccessibilitySettings.visibility = View.GONE
+        } else {
+            tvAccessibilityStatus.text = "Status: Permission Needed in Android Settings"
+            tvAccessibilityStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
+            btnOpenAccessibilitySettings.visibility = View.VISIBLE
+        }
+    }
+
+    private fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boolean {
+        if (ChatAccessibilityService.isServiceConnected) return true
+        val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
+        val enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+        val expectedId = "${context.packageName}/${serviceClass.canonicalName}"
+        return enabledServices.any { it.id.equals(expectedId, ignoreCase = true) }
+    }
+
+    private fun refreshSnapshotsUI() {
+        snapshotsItems.clear()
+        snapshotMetadataFiles.clear()
+
+        val snapshotsDir = getExternalFilesDir("ChatSnapshots")
+        val metadataFiles = snapshotsDir?.listFiles()
+            ?.filter { it.extension.lowercase(Locale.ROOT) == "json" }
+            ?.sortedByDescending { it.lastModified() }
+            ?: emptyList()
+
+        snapshotMetadataFiles.addAll(metadataFiles)
+
+        if (metadataFiles.isEmpty()) {
+            snapshotsItems.add("No chat snapshots captured yet.\n(Open a target app like WhatsApp or Telegram to test)")
+            tvSnapshotsPath.text = "Captured Snapshots: 0"
+        } else {
+            val dateFormat = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault())
+            metadataFiles.forEach { file ->
+                try {
+                    val json = JSONObject(file.readText())
+                    val title = json.optString("chatTitle", "Chat")
+                    val pkg = json.optString("packageName", "").substringAfterLast(".")
+                    val dateStr = dateFormat.format(Date(file.lastModified()))
+                    val count = json.optInt("messageCount", 0)
+                    snapshotsItems.add("💬 $title ($pkg) • $dateStr ($count items)")
+                } catch (e: Exception) {
+                    snapshotsItems.add("💬 Snapshot (${file.nameWithoutExtension})")
+                }
+            }
+            tvSnapshotsPath.text = "Captured Snapshots: ${metadataFiles.size} in /ChatSnapshots/"
+        }
+        snapshotsAdapter.notifyDataSetChanged()
+    }
+
+    private fun showSnapshotDetailsDialog(metadataFile: File) {
+        try {
+            val json = JSONObject(metadataFile.readText())
+            val title = json.optString("chatTitle", "Chat")
+            val pkg = json.optString("packageName", "")
+            val imageFileName = json.optString("imageFile", "")
+            val snippetsArray = json.optJSONArray("snippets")
+
+            val snippets = if (snippetsArray != null) {
+                (0 until snippetsArray.length()).map { snippetsArray.getString(it) }
+            } else emptyList()
+
+            val details = buildString {
+                appendLine("Target App: $pkg")
+                appendLine("Chat Title: $title")
+                appendLine("Captured Messages: ${snippets.size}")
+                appendLine()
+                appendLine("EXTRACTED CONTENT:")
+                if (snippets.isEmpty()) {
+                    appendLine("  (Visual capture only)")
+                } else {
+                    snippets.take(8).forEach { appendLine(" • $it") }
+                }
+            }
+
+            val imageFile = if (imageFileName.isNotBlank()) File(metadataFile.parentFile, imageFileName) else null
+
+            val builder = AlertDialog.Builder(this)
+                .setTitle("Chat Snapshot: $title")
+                .setMessage(details)
+                .setPositiveButton("Close", null)
+
+            if (imageFile != null && imageFile.exists()) {
+                builder.setNeutralButton("Share Snapshot") { _, _ ->
+                    try {
+                        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", imageFile)
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "image/webp"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        startActivity(Intent.createChooser(intent, "Share Chat Snapshot"))
+                    } catch (e: Exception) {
+                        Toast.makeText(this, "Could not share snapshot: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            builder.show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not open details: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -459,6 +646,8 @@ class MainActivity : AppCompatActivity() {
         refreshRecordingsUI()
         refreshWhitelistUI()
         refreshSummariesUI()
+        updateAccessibilityUIState()
+        refreshSnapshotsUI()
     }
 
     private fun getRequiredPermissions(): Array<String> {

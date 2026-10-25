@@ -2,4 +2,5 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <external-files-path name="recordings" path="Recordings" />
     <external-files-path name="summaries" path="Summaries" />
+    <external-files-path name="snapshots" path="ChatSnapshots" />
 </paths>
