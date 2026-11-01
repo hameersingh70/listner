@@ -25,7 +25,9 @@ object CallLogHelper {
         )
         val selection = "${CallLog.Calls.TYPE} = ?"
         val selectionArgs = arrayOf(CallLog.Calls.OUTGOING_TYPE.toString())
-        val sortOrder = "${CallLog.Calls.DATE} DESC LIMIT 5"
+        // Note: "LIMIT N" in sortOrder is rejected by Android 13's ContentResolver.
+        // Instead we sort and break early once we find a matching recent call.
+        val sortOrder = "${CallLog.Calls.DATE} DESC"
 
         AppLogger.log("CallLogHelper: Querying outgoing calls (minStartTime = $callStartTime)")
 
@@ -98,7 +100,8 @@ object CallLogHelper {
             CallLog.Calls.INCOMING_TYPE.toString(),
             CallLog.Calls.MISSED_TYPE.toString()
         )
-        val sortOrder = "${CallLog.Calls.DATE} DESC LIMIT 5"
+        // Note: "LIMIT N" in sortOrder is rejected by Android 13's ContentResolver.
+        val sortOrder = "${CallLog.Calls.DATE} DESC"
 
         for (attempt in 1..maxRetries) {
             try {

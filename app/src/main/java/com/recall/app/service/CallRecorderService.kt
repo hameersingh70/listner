@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import com.recall.app.R
 import com.recall.app.data.PhoneNumberStore
 import com.recall.app.util.AppLogger
+import com.recall.app.util.AudioProbeEngine
 import com.recall.app.util.CallLogHelper
 import kotlinx.coroutines.*
 import java.io.File
@@ -31,6 +32,7 @@ class CallRecorderService : Service() {
     private var isPendingIncoming = false
     private var currentTargetNumber: String? = null
     private var pendingCallStartTime: Long = 0L
+    private var recordingStartMs: Long = 0L    // tracks when MediaRecorder.start() was called
 
     private lateinit var phoneStore: PhoneNumberStore
     private val serviceJob = SupervisorJob()
@@ -156,19 +158,44 @@ class CallRecorderService : Service() {
     }
 
     // ------------------------------------------------------------------------
-    // RECORDING LOGIC WITH AUDIO SOURCE FALLBACKS
+    // RECORDING LOGIC — INTELLIGENT ADAPTIVE AUDIO SOURCE SELECTION
     // ------------------------------------------------------------------------
 
+    /**
+     * Creates and starts a MediaRecorder using the source selected by
+     * AudioProbeEngine. The probe engine:
+     *   1. Checks a cached working source first (fast path, no delay).
+     *   2. If cache is cold/invalidated, it opens a short AudioRecord burst
+     *      (~600 ms) on each candidate and picks the source with the highest
+     *      RMS amplitude above the silence threshold.
+     *   3. Falls back to VOICE_RECOGNITION if every source reads as silence
+     *      (better than MIC which is hard-silenced on Android 13 + MediaTek).
+     *
+     * After the recording is committed, handleStopRecording() checks the
+     * resulting file's size. If it is suspiciously tiny (< 50 KB for a call
+     * longer than a few seconds), the cache is invalidated so the next call
+     * triggers a fresh full probe.
+     */
     private fun createConfiguredRecorder(outputFile: File): MediaRecorder {
-        val sourcesToTry = listOf(
-            MediaRecorder.AudioSource.MIC,
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            MediaRecorder.AudioSource.DEFAULT
-        )
+        // Let the probe engine pick the best live source
+        val probeSource = AudioProbeEngine.selectBestSource(this)
+        AppLogger.log("AudioProbe selected source=$probeSource for ${outputFile.name}")
+
+        // Fallback list: probe winner first, then remaining candidates
+        val allSources = buildList {
+            add(probeSource)
+            // Add remaining candidates in priority order, skipping the already-chosen one
+            listOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.DEFAULT
+            ).forEach { if (it != probeSource) add(it) }
+        }
 
         var lastError: Exception? = null
 
-        for (source in sourcesToTry) {
+        for (source in allSources) {
             val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 MediaRecorder(this)
             } else {
@@ -188,19 +215,39 @@ class CallRecorderService : Service() {
                     prepare()
                     start()
                 }
-                AppLogger.log("MediaRecorder started successfully with AudioSource: $source -> ${outputFile.name}")
+                AppLogger.log("MediaRecorder started with AudioSource=$source -> ${outputFile.name}")
                 return recorder
             } catch (e: Exception) {
-                AppLogger.log("AudioSource $source failed: ${e.message}, trying next fallback...")
+                AppLogger.log("AudioSource $source failed: ${e.message}, trying next...")
                 lastError = e
-                try {
-                    recorder.reset()
-                    recorder.release()
-                } catch (ignored: Exception) {}
+                try { recorder.reset(); recorder.release() } catch (ignored: Exception) {}
             }
         }
 
         throw lastError ?: RuntimeException("All audio sources failed to initialize")
+    }
+
+    /**
+     * Checks the given file's byte density against the recording duration.
+     * A call that lasted > 10 s but produced < 50 KB is almost certainly silent
+     * (pure-zero AAC frames are still encoded, just tiny). Invalidate the
+     * AudioProbeEngine cache so the next call triggers a fresh full probe.
+     */
+    private fun checkAndHandleSilentRecording(file: File, recordingStartMs: Long) {
+        val durationMs = System.currentTimeMillis() - recordingStartMs
+        val sizeBytes = file.length()
+        // < 50 KB for a call > 10 s = silent recording heuristic
+        if (durationMs > 10_000L && sizeBytes < 50_000L) {
+            AppLogger.log(
+                "SilenceCheck: File ${file.name} is ${sizeBytes}B for ${durationMs}ms call — " +
+                "probable silence. Invalidating AudioProbe cache."
+            )
+            AudioProbeEngine.invalidateCache(this)
+        } else {
+            AppLogger.log(
+                "SilenceCheck: File ${file.name} OK (${sizeBytes}B, ${durationMs}ms)."
+            )
+        }
     }
 
     @Synchronized
@@ -228,6 +275,7 @@ class CallRecorderService : Service() {
 
             mediaRecorder = createConfiguredRecorder(outputFile)
             isRecording = true
+            recordingStartMs = System.currentTimeMillis()
             AppLogger.log("Started recording whitelisted contact: $normalized")
         } catch (e: Exception) {
             AppLogger.log("Error starting whitelisted recording: ${e.message}")
@@ -259,6 +307,7 @@ class CallRecorderService : Service() {
 
             mediaRecorder = createConfiguredRecorder(outputFile)
             isRecording = true
+            recordingStartMs = System.currentTimeMillis()
             AppLogger.log("Started tentative call recording ($prefix) -> ${outputFile.name}")
         } catch (e: Exception) {
             AppLogger.log("Error starting tentative recording: ${e.message}")
@@ -284,6 +333,7 @@ class CallRecorderService : Service() {
         val wasTargetNumber = currentTargetNumber
         val callStart = pendingCallStartTime
         val preDetectedOutgoing = detectedOutgoingNumber
+        val recStartMs = recordingStartMs
 
         try {
             mediaRecorder?.apply {
@@ -302,11 +352,17 @@ class CallRecorderService : Service() {
             isPendingIncoming = false
             currentTargetNumber = null
             detectedOutgoingNumber = null
+            recordingStartMs = 0L
         }
 
         if (fileToProcess != null && fileToProcess.exists()) {
             val fileSize = fileToProcess.length()
             AppLogger.log("Recorded file captured: ${fileToProcess.name} ($fileSize bytes)")
+
+            // Silence heuristic check — if the file is tiny relative to call duration,
+            // the selected AudioSource was silenced by Android. Invalidate cache so
+            // the next call triggers a fresh AudioProbe full scan.
+            checkAndHandleSilentRecording(fileToProcess, recStartMs)
 
             if (wasPendingOutgoing) {
                 serviceScope.launch {
